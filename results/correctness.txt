@@ -1,0 +1,11 @@
+brute force vs Eq.(12): max|dP| = 2.78e-16
+brute force vs Eq.(13): max|dQ| = 1.11e-16
+
+impl           blocks     max|dP|     max|dQ|       objective     rel.err
+numpy-local         1    0.00e+00    0.00e+00    45890.818115    0.00e+00
+spark-rdd           1    0.00e+00    0.00e+00    45890.818115    0.00e+00
+spark-rdd           2    5.42e-14    1.28e-15    45890.818115    1.59e-16
+spark-rdd           4    6.71e-14    1.53e-15    45890.818115    3.17e-16
+spark-rdd           8    5.77e-14    1.28e-15    45890.818115    1.59e-16
+
+RESULT: PASS

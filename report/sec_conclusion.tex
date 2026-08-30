@@ -1,0 +1,56 @@
+
+%==========================================================================
+\section{Conclusion et travaux futurs}\label{sec:conclusion}
+%==========================================================================
+
+Nous avons implémenté eALS~\cite{he2016eals} en PySpark - une version RDD fondée sur
+des broadcasts, adossée à une référence NumPy séquentielle - et vérifié que les deux
+produisent le même modèle à $\CorrWorst$ près, quel que soit le nombre de blocs, ce qui
+est le pendant empirique de l'affirmation de l'article selon laquelle eALS est
+trivialement parallélisable \emph{sans approximation}. En plus de cela, nous avons
+implémenté l'évaluation leave-one-out sur catalogue entier et une campagne
+expérimentale dont la sortie brute se trouve dans \texttt{results/*.csv}.
+
+Les résultats que nous considérons comme la substance de ce rapport :
+
+\begin{enumerate}\itemsep2pt
+\item L'affirmation de complexité tient, dans le régime pour lequel elle est
+énoncée. Sur Amazon Movies, le coût d'une itération entre $K=32$ et $K=128$ croît de
+$\GrowthEalsAmz\times$ pour eALS et $\GrowthAlsAmz\times$ pour l'ALS implicite de
+MLlib, sur les mêmes données, la même machine et le même nombre de cœurs. eALS passe
+de $\RatioAtMinAmz\times$ plus lent à $K=\KAtRatioMinAmz$ à $\RatioAtMaxAmz\times$
+plus rapide à $K=\KAtRatioAmz$. Ajuster les deux formes de complexité avec des
+constantes libres reproduit les mesures à $R^2>0,999$, mais place le croisement entre
+le terme linéaire et le terme quadratique d'eALS à $K\approx\FitCrossEalsAmz$ plutôt
+qu'au $\CrossKAmz$ prédit par le décompte de flops : le terme creux est limité par la
+mémoire et le terme dense relève de BLAS, et un décompte de flops ne peut pas voir la
+différence.
+\item La scalabilité forte est réelle mais modeste : $\SpeedupBig\times$ sur 8 cœurs
+pour ml-10m, cohérent avec une fraction série d'Amdahl de $\SerialBig$. La limite
+n'est pas l'algorithme - le parallélisme est exact et le travail se découpe
+proprement - mais la bande passante mémoire partagée, la désérialisation des
+broadcasts dans chaque worker Python, et la surcharge Python par tâche.
+\item La pondération sensible à la popularité fonctionne : à $\alpha=0,4$, HR@100
+passe de $\HRu$ à $\HRe$ sur Amazon Movies, soit $\PopGain$\,\% de mieux que le
+réglage uniforme $\alpha=0$, toutes choses égales par ailleurs.
+\item Sur la métrique qui compte en pratique - la précision pour un budget de temps
+donné - eALS atteint en $\EalsTimeToAls$\,s la meilleure précision que l'ALS de
+MLlib n'atteint jamais (HR@100 $=\AlsBestHR$ après $\AlsTimeToBest$\,s), puis continue
+de s'améliorer.
+\end{enumerate}
+
+\paragraph{Travaux futurs.} Quatre directions, dans l'ordre où nous les prendrions.
+\emph{(i) Métriques de couverture et de biais de popularité.} L'ajout le plus utile,
+de loin : mesurer la couverture du catalogue et la concentration de Gini en fonction
+de $\alpha$, et voir quelle part du gain de HR relève réellement d'une meilleure
+modélisation des préférences.
+\emph{(ii) Une implémentation co-partitionnée.} Remplacer le broadcast de $Q$ par un
+échange par blocs partitionnés où chaque ligne de facteur n'est envoyée qu'aux blocs
+qui la référencent - le schéma qu'utilise l'ALS de MLlib - et ré-exécuter l'étude
+de scalabilité sur un vrai cluster, où le coût du broadcast cesse d'être une copie
+mémoire.
+\emph{(iii) Références BPR et RCD}, pour tester l'asymétrie rappel/précision que nous
+ne pouvons actuellement que citer depuis l'article.
+\emph{(iv) Float32 et une boucle interne Numba ou Cython.} Le noyau est limité par la
+mémoire ; diviser par deux la largeur de chaque gather devrait rapporter près d'un
+facteur deux, et diviserait aussi le broadcast par deux.

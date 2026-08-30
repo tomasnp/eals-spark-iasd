@@ -1,0 +1,102 @@
+
+\appendix
+%==========================================================================
+\section{Code source complet}\label{app:code}
+%==========================================================================
+
+Tout est également disponible sur \texttt{https://github.com/tomasnp/eals-spark}. Les
+listings ci-dessous sont les fichiers tels quels (verbatim, en anglais dans le code
+source).
+
+\subsection{\texttt{src/spark\_utils.py} - session Spark}
+\lstinputlisting{../src/spark_utils.py}
+
+\subsection{\texttt{src/data.py} - chargement, filtrage 10-core, découpage}
+\lstinputlisting{../src/data.py}
+
+\subsection{\texttt{src/eals\_local.py} - référence NumPy et noyaux partagés}
+\lstinputlisting{../src/eals_local.py}
+
+\subsection{\texttt{src/eals\_rdd.py} - implémentation Spark RDD}
+\lstinputlisting{../src/eals_rdd.py}
+
+\subsection{\texttt{src/evaluate.py} - HR@$k$, NDCG@$k$, classement sur catalogue entier}
+\lstinputlisting{../src/evaluate.py}
+
+\subsection{\texttt{src/baselines.py} - ALS de MLlib et MostPopular}
+\lstinputlisting{../src/baselines.py}
+
+\subsection{\texttt{src/check\_correctness.py} - le contrôle d'exactitude}
+\lstinputlisting{../src/check_correctness.py}
+
+\subsection{\texttt{src/experiments.py} - la campagne de mesures}
+\lstinputlisting{../src/experiments.py}
+
+\subsection{\texttt{src/plots.py} - figures}
+\lstinputlisting{../src/plots.py}
+
+\subsection{\texttt{report/tables.py} - chaque chiffre de ce rapport}
+\lstinputlisting{../report/tables.py}
+
+\subsection{\texttt{scripts/env.sh}, \texttt{run\_all.sh}, \texttt{build\_report.sh}}
+\lstinputlisting[language=bash]{../scripts/env.sh}
+\lstinputlisting[language=bash]{../scripts/run_all.sh}
+\lstinputlisting[language=bash]{../scripts/build_report.sh}
+
+%==========================================================================
+\section{Le notebook de démonstration}\label{app:nb}
+%==========================================================================
+
+\texttt{notebooks/demo\_small\_data.ipynb} exécute tout le pipeline de bout en bout
+sur \textbf{ml-100k} (943 utilisateurs, 1\,152 items, 97\,953 interactions) en
+quelques minutes sur un portable. Son but est la vérification, pas la mesure : un
+lecteur devrait pouvoir exécuter « Run All » et voir, sans attendre, que chaque
+affirmation de ce rapport est étayée par du code qui s'exécute. Chaque section
+indique son entrée et sa sortie.
+
+\begin{table}[h]
+\centering\small
+\caption{Cellules du notebook, avec entrée et sortie.}\label{tab:nb}
+\begin{tabular}{@{}p{0.5cm}p{4.6cm}p{4.6cm}p{5.2cm}@{}}
+\toprule
+\S & Entrée & Sortie & Ce que cela démontre \\
+\midrule
+1 & le JDK installé & versions Java / Spark / NumPy, master Spark et parallélisme
+  & l'environnement est bien celui décrit en Section~\ref{sec:setup} ; en particulier
+    \texttt{JAVA\_HOME} pointe vers un JDK 17. \\
+2 & \texttt{data/raw/ml-100k/u.data} (brut \texttt{user\,item\,rating\,ts}) & le
+    dictionnaire de statistiques et les premières lignes du découpage d'entraînement
+    & le filtrage 10-core, la ré-indexation dense et le découpage leave-one-out
+    reproduisent le Tableau~\ref{tab:datasets}, ligne \texttt{ml-100k}. \\
+3 & fréquences des items d'entraînement & $\min/\text{médiane}/\max$ de $c_i$ et
+    $\sum_i c_i$ & l'Éq.~\eqref{eq:ci} est correctement implémentée :
+    $\sum_i c_i=c_0$ pour tout $\alpha$, et $\alpha=0,4$ étale $c_i$ sur un rapport
+    6:1 sur ml-100k alors que $\alpha=0$ le réduit à $c_0/N$. Cela montre aussi que
+    l'item le plus populaire atteint $c_i>1$ - la réserve S2 de la
+    Section~\ref{sec:discussion}. \\
+4 & les paires d'entraînement sous forme de deux tableaux d'entiers & un tableau de
+    $J$ par itération et sa décroissance & l'objectif~\eqref{eq:obj7} décroît de
+    façon monotone : les règles de mise à jour~\eqref{eq:pu}--\eqref{eq:qi} sont
+    correctes. \\
+5 & le DataFrame d'entraînement, 8 partitions & temps réel par itération décomposé en
+    étape utilisateur / étape item / broadcast / driver & l'anatomie d'une itération
+    distribuée, et la part prise par la partie non parallèle. \\
+6 & les modèles des \S4 et \S5 & $\max|\Delta P|$, $\max|\Delta Q|$ et une assertion
+    (\texttt{assert}) & le contrôle d'exactitude de la
+    Section~\ref{sec:correctness}, en miniature. La cellule \emph{échoue
+    bruyamment} si les implémentations divergent. \\
+7 & matrices de facteurs + l'ensemble de test leave-one-out & HR@10/@100 et
+    NDCG@10/@100 pour MostPopular, eALS, eALS avec $\alpha=0$ et MLlib ALS & eALS bat
+    le plancher de popularité avec une large marge, et $\alpha>0$ bat $\alpha=0$. \\
+8 & les mêmes données réajustées avec 1, 2, 4 cœurs & secondes par itération,
+    accélération, efficacité & une miniature de la Section~\ref{sec:strong}, et une
+    honnête : sur ml-100k l'accélération ressort \emph{en dessous de un} - plus de
+    cœurs rendent eALS plus lent, car les données sont bien trop petites pour Spark. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Temps d'exécution.} Environ deux minutes de bout en bout sur la machine
+de la Section~\ref{sec:setup}, dominées par les démarrages de session Spark
+(\S8 redémarre la session une fois par nombre de cœurs, ce qui est inévitable :
+\texttt{local[$p$]} est fixé à la création de la session).

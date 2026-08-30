@@ -1,0 +1,22 @@
+data/raw/
+data/processed/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+spark-warehouse/
+checkpoints/
+report/*.aux
+report/*.log
+report/*.out
+report/*.bbl
+report/*.blg
+report/*.toc
+report/*.synctex.gz
+.DS_Store
+
+# pdflatex lancé depuis report/tables/ y dépose texput.log
+report/tables/*.log
+report/tables/*.aux
+
+# le PDF versionné est la copie racine, pas la sortie de build
+report/report.pdf

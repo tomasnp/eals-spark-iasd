@@ -1,0 +1,188 @@
+
+%==========================================================================
+\section{Discussion : forces et faiblesses}\label{sec:discussion}
+%==========================================================================
+
+\subsection{Points forts}
+
+\paragraph{S1 - Quadratique, pas cubique, en $K$.} C'est l'affirmation centrale de
+l'article, et la Section~\ref{sec:factors} la confirme dans la forme qui résiste à
+l'examen : sur la fenêtre $K=32\rightarrow128$ sur Amazon Movies, une itération eALS
+croît de $\GrowthEalsAmz\times$ et une itération ALS de $\GrowthAlsAmz\times$. Comme
+la précision de la MF implicite continue de s'améliorer avec $K$, le régime où elle est
+la plus performante est précisément le régime où eALS gagne par la plus grande marge
+- et le croisement à $K=\FlipKAmz$ se situe en dessous du $K$ que l'on veut utiliser.
+
+\paragraph{S2 - Pas d'inversion de matrice, donc pas de problème de
+conditionnement.} Chaque mise à jour de coordonnée est une division scalaire. ALS
+doit inverser $Q^{\top}W^uQ+\lambda I$ une fois par utilisateur ; à $K=256$ avec un
+$Q$ mal conditionné, c'est là que vivent les ennuis numériques, et c'est aussi
+pourquoi MLlib a besoin d'un chemin Cholesky avec un plancher de régularisation. eALS
+n'a pas un tel objet.
+
+Une réserve que l'article ne soulève pas, et que nous pouvons préciser. Le
+dénominateur de~\eqref{eq:pu} est
+$\sum_{i\in\mathcal{R}_u}(w_{ui}-c_i)q_{if}^2+s^q_{ff}+\lambda$, dans lequel
+$s^q_{ff}=\sum_i c_iq_{if}^2>0$ et $\lambda>0$, mais la première somme n'est
+\emph{pas} de signe défini : rien dans le modèle n'interdit $c_i>w_{ui}$. Comme
+$c_i \approx c_0/N$ en moyenne, cela se produit sur les petits catalogues - sur
+ml-100k avec le $c_0=512$ de l'article et $N=1\,152$, l'item le plus populaire atteint
+$c_i=1,07>1=w_{ui}$. Nous n'avons jamais observé d'objectif non monotone
+(Figure~\ref{fig:conv}), car $s^q_{ff}$ domine en pratique, mais la garantie est
+empirique plutôt que structurelle, et c'est une raison de faire varier $c_0$ avec $N$
+plutôt que de transposer une valeur d'un jeu de données à l'autre.
+
+\paragraph{S3 - Un parallélisme exact.} La
+Section~\ref{sec:correctness} mesure un écart maximal de $\CorrWorst$ entre la
+référence NumPy séquentielle et les exécutions Spark à 1, 2, 4 et 8 blocs, et
+l'exécution à un bloc est identique au bit près. Rien n'a besoin d'être ajusté,
+aucune obsolescence (\emph{staleness}) n'a besoin d'être tolérée, aucun taux
+d'apprentissage n'a besoin d'être re-recherché quand le nombre de workers change -
+ce que la SGD distribuée ne peut précisément pas promettre.
+Opérationnellement cela vaut plus qu'il n'y paraît : cela signifie que le nombre de
+partitions est un pur bouton de performance, et qu'une expérience de scalabilité ne
+peut pas changer silencieusement le modèle qu'elle mesure.
+
+\paragraph{S4 - Pas de taux d'apprentissage.} Chaque mise à jour est le minimiseur
+exact de l'objectif le long d'une coordonnée. Comparé à RCD~\cite{devooght2015rcd},
+qui a besoin d'une recherche linéaire à chaque pas, ou à BPR~\cite{rendle2009bpr}, dont
+la précision est visiblement fonction de la taille du pas, cela retire une dimension
+entière du budget d'ajustement. Notre propre expérience le confirme : aucune
+configuration que nous ayons exécutée n'a jamais divergé, et l'objectif décroît de
+façon monotone à chaque itération sur les deux jeux de données
+(Figure~\ref{fig:conv}).
+
+\subsection{Points faibles}
+
+\paragraph{W1 - Le balayage de coordonnées est intrinsèquement séquentiel à
+l'intérieur d'une ligne.} La boucle en $K$ est du Gauss--Seidel : $p_{u,f+1}$ doit
+voir le $p_{uf}$ mis à jour. Le parallélisme est donc limité à $\min(M,B)$ dans
+l'étape utilisateur et $\min(N,B)$ dans l'étape item, et le travail par bloc contient
+toujours une boucle Python de longueur $K$. C'est cette boucle qui a obligé
+l'implémentation à être vectorisée \emph{entre} utilisateurs : c'est le seul axe
+restant. Dans un contexte à peu d'utilisateurs et à $K$ énorme - l'opposé d'un
+système de recommandation - eALS se paralléliserait mal.
+
+\paragraph{W2 - Diffuser $Q$ ne passe pas à l'échelle des catalogues réels.} La
+conception RDD exige $P$ et $Q$ sur le driver et une copie désérialisée de chacun par
+worker Python. À $N=10^6$ items et $K=128$ cela fait 1\,Go par worker. C'est la limite
+structurelle de la conception retenue en Section~\ref{sec:solution}, et elle est
+assumée : l'alternative - faire transiter les facteurs par des jointures avec
+shuffle - déplace $O(|\mathcal{R}|K)$ au lieu de $O((M+N)K)$, soit un facteur
+$\approx 300$ sur ml-1m, et se paie à chaque itération. Il n'y a pas de repas gratuit
+ici : à une certaine taille de catalogue, la conception fondée sur les jointures gagne
+simplement parce que la conception broadcast cesse de tenir en mémoire, et la bonne
+réponse industrielle n'est probablement ni l'une ni l'autre, mais le schéma à
+partitionnement par blocs de MLlib, où chaque ligne de facteur n'est envoyée qu'aux
+blocs qui en ont besoin.
+
+\paragraph{W3 - Le schéma de pondération exige une recherche bidimensionnelle
+coûteuse.} $c_0$ et $\alpha$ interagissent, les propres optima de l'article diffèrent
+entre ses deux jeux de données ($c_0=512,\alpha=0,4$ sur Yelp ; $c_0=64,\alpha=0,5$
+sur Amazon), et chaque point de la grille est un entraînement complet - une
+recherche bidimensionnelle sérieuse représente donc des dizaines d'entraînements. Nous
+avons repris les valeurs de l'article plutôt que de les rechercher, ce qui est
+précisément la raison pour laquelle nos chiffres de précision ne doivent pas être lus
+comme un optimum. Pire, la sensibilité n'est pas symétrique : un $c_0$ trop petit
+détruit la précision, un $c_0$ trop grand la dégrade doucement, donc une grille
+grossière peut facilement tomber sur un plateau et déclarer victoire.
+
+\paragraph{W4 - Un protocole d'évaluation indulgent, en particulier envers la
+pondération par popularité.} Trois problèmes distincts :
+\begin{itemize}\itemsep2pt
+\item \emph{Le leave-one-out par horodatage n'est pas un découpage réaliste.} Il
+laisse fuir le futur : l'ensemble d'entraînement de l'utilisateur $u$ contient des
+interactions survenues après l'interaction de test de l'utilisateur $v$. L'article le
+dit lui-même et ajoute pour cette raison un protocole en ligne fondé sur une coupure
+chronologique globale, que nous n'avons pas reproduit ; tous nos chiffres de précision
+héritent donc de ce biais.
+\item \emph{Des négatifs échantillonnés rendraient les chiffres incomparables.} Nous
+classons contre le catalogue entier précisément parce qu'échantillonner 100 négatifs~\cite{krichene2020sampled}
+est connu pour changer non seulement les valeurs mais l'\emph{ordre} relatif des
+systèmes comparés (Krichene et Rendle, KDD 2020). Cela coûte $O(MNK)$ par évaluation et c'est
+la principale raison pour laquelle notre évaluation est distribuée.
+\item \emph{HR et NDCG ne mesurent rien sur la diversité ou la couverture du
+catalogue.} C'est la critique que nous jugeons la plus importante, car elle pointe
+vers la contribution même de l'article. Pondérer les données manquantes par la
+popularité indique au modèle qu'un manque sur un blockbuster est une forte preuve de
+désintérêt - mais le même mécanisme pousse les items impopulaires vers un score
+prédit bas pour tout le monde, car il est bon marché de se tromper sur eux. Une
+métrique qui demande seulement « l'item retenu était-il dans le top 100 » ne peut pas
+voir la concentration qui en résulte, et les items retenus sont eux-mêmes distribués
+selon la popularité, donc la métrique est biaisée positivement en faveur de tout ce
+qui amplifie la popularité. Nous mesurons un vrai
+gain à partir de $\alpha>0$ (Section~\ref{sec:quality}), et nous croyons qu'il est réel ;
+nous croyons aussi qu'une évaluation rapportant la couverture dans l'espace des items
+montrerait qu'une partie de ce gain est un biais de popularité plutôt qu'une
+meilleure modélisation des préférences. Mesurer cela est l'extension la plus utile de
+ce travail.
+\end{itemize}
+
+\paragraph{W5 - eALS optimise une perte de régression, pas une perte de
+classement.} L'objectif est l'erreur quadratique sur une matrice $0/1$. C'est un bon
+objectif de \emph{rappel}, ce que montrent exactement nos résultats - eALS est le
+plus fort en HR@100 - et un objectif de \emph{précision} médiocre. BPR, qui
+optimise directement l'ordre par paires, est le concurrent naturel aux petites
+coupures ; cette asymétrie entre rappel et précision est un résultat classique de la
+littérature sur la recommandation top-$N$~\cite{cremonesi2010topn}. Nous n'avons pas implémenté BPR (voir plus
+bas) et ne pouvons donc pas le quantifier sur nos données ; l'article rapporte le même
+schéma.
+
+Un point connexe et plus inconfortable : Rendle et al. ont
+revisité iALS - la référence même à laquelle eALS est comparé - sur des
+benchmarks standards et ont trouvé qu'une fois sa régularisation et son poids sur les
+données non observées correctement ajustés, il rivalise avec des méthodes bien plus
+récentes. Notre propre référence ALS est celle de MLlib, avec le $\lambda=0,01$ de
+l'article et l'$\alpha$ par défaut de MLlib ; nous ne l'avons \emph{pas} ajustée. Une
+partie de l'écart de $\EalsOverAls$\,\% que nous mesurons est donc attribuable à un
+effort d'ajustement inégal, et une lecture honnête du Tableau~\ref{tab:quality}
+devrait le traiter comme une borne supérieure de l'avantage d'eALS sur un iALS bien
+ajusté.
+
+\subsection{Limites de validité des mesures}
+
+Nous les listons car la plupart sont structurelles et ne peuvent pas être corrigées
+sur un portable.
+
+\begin{enumerate}\itemsep2pt
+\item \textbf{\texttt{local[$p$]} n'est pas un cluster.} Il n'y a pas de réseau, pas
+de sérialisation entre machines, pas de tâche à la traîne due à un nœud lent, pas de
+tolérance aux pannes exercée. Nos chiffres \emph{surestiment} donc la performance de
+la conception RDD sur un vrai cluster, où diffuser $Q$ coûte de la bande passante
+réseau et non une copie mémoire, et \emph{sous-estiment} d'autant la valeur de
+l'alternative co-partitionnée écartée en Section~\ref{sec:solution}.
+\item \textbf{La bande passante mémoire partagée est la vraie limite, pas le nombre
+de cœurs.} Le noyau est une séquence de gathers et de sommes par segment sur des
+tableaux bien plus grands que le L2. Passer de 1 à 8 cœurs multiplie la demande sur un
+seul contrôleur mémoire, ce qui explique une grande partie de l'écart entre
+l'accélération mesurée $\SpeedupBig\times$ et l'idéal $8\times$. Un cluster de 8
+machines à un cœur paraîtrait meilleur qu'une seule machine à 8 cœurs ici.
+\item \textbf{La dérive thermique est mesurable, et nous l'avons attrapée.} Deux
+exécutions du même balayage en $K$ sur ml-1m, à une heure d'intervalle dans une
+campagne continue, différaient jusqu'à un facteur deux sur les configurations les
+plus lourdes : la seconde exécution suivait une mesure ALS bien plus lourde et la
+machine était chaude. Un portable sous charge soutenue à 8 cœurs ne maintient pas une
+horloge constante. Nos parades sont méthodologiques plutôt que physiques -
+répétitions entrelacées entre configurations plutôt que regroupées, et un temps de
+repos entre configurations (\texttt{--interleave}, \texttt{--cooldown}) - et les
+figures montrent des barres min--max sur 9 échantillons par itération afin que
+l'étalement résiduel soit visible. Sur une machine dédiée à horloge fixe, ces
+précautions seraient inutiles ; sur celle-ci, elles font la différence entre une
+mesure et une anecdote.
+\item \textbf{Deux familles de jeux de données, un seul domaine chacune.} Amazon
+Movies et MovieLens sont tous deux de nature cinématographique, tous deux
+modérément denses après filtrage 10-core. Rien ici ne dit comment eALS se comporte
+sur un catalogue de $10^7$ items avec une moyenne de deux interactions chacun.
+\item \textbf{Le notebook est le seul test de bout en bout.} Il n'y a pas de suite de
+tests unitaires ; l'exactitude est garantie par \texttt{check\_correctness.py} (qui
+compare bien à une référence par force brute) et par le fait que le notebook
+s'exécute jusqu'au bout. Cela a suffi à attraper de vrais bugs - notamment un
+\texttt{PYTHONPATH} manquant sur les workers - mais ce n'est pas un substitut à des
+tests.
+\item \textbf{Tout ce qui figurait dans l'énoncé n'a pas été mesuré.} Nous n'avons
+pas implémenté BPR ni RCD : les deux sont
+des références pertinentes dans l'article, mais chacune est un projet en soi et le
+budget est allé à l'étude de scalabilité que l'énoncé pondère le plus. Nous le disons
+plutôt que de rapporter des chiffres que nous n'avons pas produits. Nous n'avons pas
+non plus utilisé Yelp, pour la raison donnée en Section~\ref{sec:dataset}.
+\end{enumerate}

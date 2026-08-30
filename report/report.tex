@@ -1,0 +1,758 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{lmodern}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage[font=small,labelfont=bf,skip=4pt]{caption}
+\usepackage{subcaption}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+\emergencystretch=3em   % long \texttt tokens must not overflow the margin
+
+\graphicspath{{figures/}{../results/figures/}}
+
+\definecolor{kw}{RGB}{0,90,160}
+\definecolor{cm}{RGB}{90,120,90}
+\definecolor{st}{RGB}{150,60,20}
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cm}\itshape,
+  stringstyle=\color{st},
+  numbers=left, numberstyle=\tiny\color{gray}, numbersep=6pt,
+  frame=single, rulecolor=\color{gray!40},
+  breaklines=true, showstringspaces=false, captionpos=b,
+  language=Python, tabsize=4, xleftmargin=14pt,
+  % listings lit le fichier octet par octet : sans ces deux lignes, un accent dans
+  % un listing casse la compilation avec « Invalid UTF-8 byte sequence ».
+  extendedchars=true,
+  literate={é}{{\'e}}1 {è}{{\`e}}1 {ê}{{\^e}}1 {ë}{{\"e}}1 {É}{{\'E}}1
+           {à}{{\`a}}1 {â}{{\^a}}1 {ù}{{\`u}}1 {û}{{\^u}}1 {ü}{{\"u}}1
+           {ô}{{\^o}}1 {î}{{\^\i}}1 {ï}{{\"\i}}1 {ç}{{\c c}}1 {œ}{{\oe}}1,
+}
+
+\input{tables/macros}
+
+% \input adds a \relax after the file, which opens a spurious cell when the
+% fragment sits between \midrule and \bottomrule. The TeX primitive does not.
+\makeatletter\newcommand{\inputrows}[1]{\@@input #1 }\makeatother
+
+% A figure whose experiment has not been run must not break the build.
+\newcommand{\figplot}[2]{%
+  \IfFileExists{../results/figures/#1.pdf}%
+    {\includegraphics[width=#2]{#1}}%
+    {\fbox{\parbox{#2}{\centering\vspace{2.5em}\emph{La figure
+      \texttt{\detokenize{#1}} n'a pas été générée : l'expérience
+      correspondante n'a pas été exécutée.}\vspace{2.5em}}}}}
+
+\title{\vspace{-1.2cm}\textbf{Factorisation matricielle rapide pour la recommandation en ligne\\
+à partir de retours implicites : une implémentation Spark et\\ une étude expérimentale de sa scalabilité}}
+\author{Thomas Sinapi \and Anaël Ernadote\\[4pt]
+\normalsize M2 IASD - Université Paris-Dauphine PSL\\
+\normalsize Projet \emph{Machine Learning for Big Data} - 2026}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-0.8cm}
+
+\begin{abstract}
+\noindent
+He et al.~\cite{he2016eals} proposent \textbf{eALS}, un algorithme de recommandation
+qui apprend à partir de simples traces d'usage (clics, achats) plutôt que de notes.
+Sa particularité est de traiter les articles que l'utilisateur n'a pas vus non pas
+tous de la même façon, mais en fonction de leur popularité. Les auteurs affirment que
+leur algorithme se parallélise très facilement, sans jamais le vérifier : ils ne
+fournissent aucune implémentation distribuée.
+
+C'est ce que fait ce rapport. Nous écrivons eALS en PySpark, ainsi qu'une version
+séquentielle de référence en NumPy, et nous montrons que les deux produisent
+exactement le même modèle (écart maximal $\CorrWorst$) : la parallélisation ne coûte
+aucune précision. Nous mesurons ensuite le comportement du code sur un portable à
+8 cœurs et quatre jeux de données de $10^5$ à $10^7$ interactions, dont Amazon Movies,
+l'un des deux jeux utilisés par l'article.
+
+Deux résultats principaux. Côté précision, eALS obtient $+\EalsOverAls$\,\% de HR@100
+par rapport à l'ALS de Spark MLlib, et son coût croît beaucoup plus lentement avec le
+nombre de facteurs $K$ ($\GrowthEalsAmz\times$ contre $\GrowthAlsAmz\times$ entre
+$K=32$ et $K=128$). Côté parallélisme en revanche, l'accélération plafonne à
+$\SpeedupBig\times$ sur 8 cœurs : la limite n'est pas l'algorithme, mais la machine.
+\end{abstract}
+
+\vspace{0.2cm}
+\tableofcontents
+\vspace{0.3cm}
+
+%==========================================================================
+\section{Introduction et énoncé du problème}
+%==========================================================================
+
+\paragraph{Le problème.} Un système de recommandation apprend rarement à partir de
+notes. Il apprend à partir de traces : ce que l'utilisateur a cliqué, lu, acheté. Ces
+traces sont abondantes, mais elles n'ont qu'un seul côté. Elles disent ce qu'un
+utilisateur a fait, jamais ce qu'il a rejeté. Un article non consulté peut aussi bien
+signifier « ça ne m'intéresse pas » que « je ne l'ai jamais vu passer ».
+
+C'est une vraie difficulté, pas un détail. Si l'on entraîne un modèle uniquement sur
+les interactions observées, il apprend à répondre « oui » partout, et ce modèle absurde
+obtient un score parfait : il n'a jamais vu un seul exemple négatif. La solution
+classique, due à Hu et al.~\cite{hu2008implicit}, consiste à considérer que toute paire
+(utilisateur, article) non observée est un négatif, mais un négatif \emph{faible},
+auquel on accorde un poids $w_0$ petit et identique partout.
+
+\paragraph{Ce que change eALS.} L'article~\cite{he2016eals} conteste ce poids unique.
+Ne pas avoir vu un film à succès est un indice assez fort de désintérêt ; ne pas avoir
+vu un film confidentiel n'indique presque rien. Les auteurs remplacent donc le poids
+unique $w_0$ par un poids $c_i$ propre à chaque article, croissant avec sa popularité.
+
+Le problème est que ce changement, apparemment anodin, casse l'algorithme existant.
+L'ALS classique calcule un vecteur entier de préférences à la fois, ce qui l'oblige à
+inverser une matrice pour chaque utilisateur et chaque article. Cette opération n'est
+abordable que grâce à un précalcul partagé, et ce précalcul n'est possible que si le
+poids est identique partout. Autrement dit : dès que l'on veut des poids différenciés,
+la recette ne fonctionne plus.
+
+La réponse de He et al.\ est de changer de granularité. Plutôt que de résoudre un
+vecteur entier, ils mettent à jour \emph{une seule coordonnée à la fois}. Chaque mise à
+jour devient alors une simple division, sans aucune inversion de matrice. C'est ce que
+signifie le « e » d'eALS : \emph{element-wise}, élément par élément. Le gain est d'un
+facteur $K$ (le nombre de dimensions du modèle) sur le coût d'une itération, et les
+poids peuvent enfin varier d'un article à l'autre.
+
+\paragraph{Le point de départ de ce projet.} Ces mises à jour ne lisent que des données
+partagées en lecture seule. Les auteurs en concluent qu'eALS est « trivialement
+parallélisable » : on peut confier des groupes d'utilisateurs différents à des machines
+différentes, et le résultat sera \emph{exactement} celui du calcul séquentiel, pas une
+approximation.
+
+L'article s'arrête là. Aucune implémentation distribuée n'est fournie, et cette
+affirmation n'est jamais vérifiée. C'est précisément ce que demande le sujet du projet,
+et ce que fait ce rapport : écrire l'implémentation Spark manquante, vérifier que le
+parallélisme est bien exact, et mesurer ce qu'il rapporte réellement.
+
+\paragraph{Plan.} La Section~\ref{sec:solution} décrit la solution retenue et justifie
+les choix de conception. La Section~\ref{sec:algo} explique l'algorithme et comment
+nous le distribuons. La Section~\ref{sec:code} commente les fragments de code qui
+comptent. La Section~\ref{sec:exp} présente les mesures. La
+Section~\ref{sec:discussion} discute forces et faiblesses. Les annexes contiennent le
+code complet et un notebook de démonstration.
+
+%==========================================================================
+\section{La solution retenue}\label{sec:solution}
+%==========================================================================
+
+\subsection{Architecture générale}
+
+Le système est un petit paquet Python plat (Table~\ref{tab:modules}). Il n'y a
+délibérément ni framework, ni hiérarchie de classes, ni couche de configuration : ce
+qui est intéressant, c'est le noyau numérique et la façon dont Spark l'ordonnance, et
+les deux doivent tenir sur un écran.
+
+\begin{table}[h]
+\centering\small
+\caption{Modules. Tout est en Python ; NumPy fait l'algèbre locale, Spark fait la
+distribution.}\label{tab:modules}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Module & Rôle & Lignes \\
+\midrule
+\texttt{spark\_utils.py}      & l'unique endroit où la \texttt{SparkSession} est configurée & 42 \\
+\texttt{data.py}              & chargement, filtrage 10-core, ré-indexation dense, découpage LOO & 133 \\
+\texttt{eals\_local.py}       & référence NumPy \emph{et} les deux noyaux de mise à jour partagés & 147 \\
+\texttt{eals\_rdd.py}         & implémentation Spark RDD (fondée sur les broadcasts) & 173 \\
+\texttt{baselines.py}         & ALS implicite de MLlib~\cite{meng2016mllib}, MostPopular & 37 \\
+\texttt{evaluate.py}          & classement sur le catalogue entier, HR@$k$, NDCG@$k$ & 69 \\
+\texttt{check\_correctness.py}& les deux implémentations doivent concorder & 99 \\
+\texttt{experiments.py}       & chaque mesure $\rightarrow$ \texttt{results/*.csv} & 217 \\
+\texttt{plots.py}             & chaque figure $\rightarrow$ \texttt{results/figures} & 158 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Une propriété que nous jugeons importante : \textbf{le noyau numérique n'existe qu'une
+seule fois}. \texttt{eals\_local.update\_users} et \texttt{update\_items} sont
+importées telles quelles par la version RDD. Seul l'\emph{ordonnancement} diffère entre
+les deux. Tout écart entre elles localise donc un bug de plomberie, jamais un bug de
+formule - et la Section~\ref{sec:correctness} montre qu'il n'y en a aucun.
+
+\subsection{RDD ou DataFrame ?}
+
+L'énoncé autorise l'un ou l'autre. Nous avons retenu les
+\textbf{RDD~\cite{zaharia2012rdd} avec broadcast}, et le choix se justifie par un
+argument de volume de communication plutôt que par une préférence d'API. Les deux
+parallélisations envisageables ne sont pas deux écritures d'un même programme :
+
+\begin{itemize}\itemsep2pt
+\item \textbf{RDD + broadcast} (retenu). Les matrices de facteurs vivent sur le driver ;
+à chaque étape, celle qui est en lecture seule est diffusée (broadcast), et chaque tâche
+met à jour les lignes qu'elle possède. Par étape, le réseau transporte $O(NK)$ (le
+broadcast) plus $O(MK)$ (le résultat collecté).
+\item \textbf{DataFrame + jointure/\texttt{cogroup}}. Les
+facteurs restent distribués sous forme de DataFrames ; une tâche reçoit les facteurs
+dont elle a besoin via une jointure avec shuffle. Rien n'est jamais assemblé sur le
+driver, donc le modèle peut dépasser sa mémoire - mais le shuffle transporte
+$O(|\mathcal{R}|K)$ par étape au lieu de $O((M+N)K)$. Sur ml-1m ce rapport vaut
+$|\mathcal{R}|/N \approx 300$.
+\end{itemize}
+
+Sur la machine visée - un seul portable, un modèle de quelques dizaines de Mo - la
+contrainte de mémoire du driver qui justifierait la seconde option ne se présente
+jamais, tandis que le facteur $\approx 300$ sur le volume échangé, lui, se paie à chaque
+itération. Nous implémentons donc uniquement la version RDD. La limite de cette
+décision est discutée en Section~\ref{sec:discussion} : c'est elle qui borne la taille
+de modèle que ce code peut traiter.
+
+\subsection{Choix du jeu de données}\label{sec:dataset}
+
+Nous utilisons deux familles de jeux de données, pour deux usages distincts.
+
+\textbf{Amazon Movies} est l'un des deux jeux de l'article, et c'est là que nous
+mesurons la précision. Il est très creux (99,87\,\% de cases vides), ce qui correspond
+au régime d'un vrai catalogue. Nous partons du fichier de notes de la catégorie
+Films \& TV du graphe produits Amazon~\cite{mcauley2015amazon}, et non du dump brut cité
+par l'article, qui n'est plus commode à obtenir ; c'est la même source et le même
+domaine, sur un instantané un peu différent. Nos chiffres de précision ne sont donc pas
+directement comparables à ceux de l'article, et nous ne le prétendons pas.
+
+\textbf{MovieLens 100k / 1M / 10M}~\cite{harper2015movielens} sert aux mesures de temps. Une étude de scalabilité
+a besoin du même jeu de données à plusieurs tailles, ce qu'Amazon ne fournit pas :
+MovieLens offre une échelle propre en $\times100$ avec une sémantique identique à chaque
+palier.
+
+Les quatre jeux subissent le même prétraitement : les notes sont ignorées (une
+interaction vaut $1$), on ne garde que les utilisateurs et les articles ayant au moins
+10 interactions (filtrage \emph{10-core}), les identifiants sont renumérotés de façon
+contiguë, et l'on met de côté la dernière interaction de chaque utilisateur pour le
+test (protocole \emph{leave-one-out}).
+
+\begin{table}[h]
+\centering\small
+\caption{Jeux de données après filtrage 10-core et ré-indexation dense.}\label{tab:datasets}
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+Jeu de données & Utilisateurs $M$ & Items $N$ & $|\mathcal{R}|$ & Sparsité & Train & Test LOO \\
+\midrule
+\inputrows{tables/tab_datasets.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Matériel et logiciels}\label{sec:setup}
+
+Tout tourne sur un unique \textbf{ordinateur portable Apple série M, 8 cœurs
+physiques, 16\,Go}, avec \textbf{Spark 4.1.0} en mode \texttt{local[$p$]},
+\textbf{Python 3.11}, \textbf{NumPy 2.3} et \textbf{OpenJDK 17}. Il n'y a pas de
+cluster : $p$, le nombre de cœurs, est le réglage que font varier les expériences de
+parallélisme.
+
+Un point de configuration mérite d'être signalé car il conditionne la validité des
+mesures. Chaque tâche Spark appelle NumPy, et NumPy lance de lui-même ses propres
+threads de calcul. Sur 8 cœurs, cela donne 8 tâches $\times$ 8 threads $=$ 64 threads en
+concurrence, et la mesure à « 1 cœur » se retrouve silencieusement parallélisée : toute
+accélération calculée ensuite est dénuée de sens. Nous bridons donc NumPy à un seul
+thread (\texttt{scripts/env.sh}), de sorte que Spark soit la seule source de
+parallélisme. Signalons aussi que Spark 4 exige Java 17 ou 21 ; sur un JDK plus récent,
+aucun job ne démarre.
+
+Tous les temps rapportés sont des médianes. Chaque configuration est répétée 3 fois,
+chaque exécution effectue 4 itérations dont la première est écartée (échauffement), soit
+9 mesures par point ; les barres d'erreur des figures donnent le minimum et le maximum.
+La graine aléatoire est fixée partout, si bien que deux exécutions identiques
+produisent le même modèle au bit près.
+
+%==========================================================================
+\section{L'algorithme}\label{sec:algo}
+%==========================================================================
+
+\subsection{Modèle et objectif}
+
+\paragraph{L'idée du modèle.} On dispose d'un tableau géant à $M$ lignes
+(les utilisateurs) et $N$ colonnes (les articles), rempli de $1$ là où une interaction a
+eu lieu et de $0$ partout ailleurs. Ce tableau est immense et presque vide : sur Amazon
+Movies, plus de $99{,}8$\,\% des cases sont à zéro.
+
+La factorisation matricielle consiste à décrire chaque utilisateur et chaque article par
+une courte liste de $K$ nombres, appelés \emph{facteurs latents} - typiquement $K=32$.
+On peut se les représenter comme des goûts non nommés : « films d'action », « cinéma
+d'auteur », etc., découverts automatiquement plutôt que définis à la main. La note
+prédite pour un couple (utilisateur, article) est alors simplement le produit scalaire
+de leurs deux listes : si les goûts coïncident, le score est élevé.
+
+Apprendre le modèle revient donc à chercher les listes de nombres qui reproduisent au
+mieux le tableau observé. Formellement, avec $P$ la matrice des facteurs utilisateurs,
+$Q$ celle des articles et $\hat r_{ui}=\mathbf{p}_u^{\top}\mathbf{q}_i$ la prédiction,
+on minimise l'écart quadratique sur \emph{toutes} les cases, chacune pondérée par un
+poids $w_{ui}$ (Éq.~2 de l'article) :
+\begin{equation}\label{eq:obj}
+J \;=\; \sum_{u=1}^{M}\sum_{i=1}^{N} w_{ui}\,(r_{ui}-\hat r_{ui})^2
+\;+\;\lambda\Big(\textstyle\sum_u \|\mathbf p_u\|^2+\sum_i\|\mathbf q_i\|^2\Big),
+\end{equation}
+avec $r_{ui}=1,\ w_{ui}=1$ sur les paires observées et $r_{ui}=0,\ w_{ui}=c_i$ ailleurs.
+Le second terme, piloté par $\lambda$, est une régularisation : il pénalise les
+facteurs de grande amplitude et empêche le modèle de surapprendre. En séparant les
+cases observées des cases vides, on obtient la forme réellement optimisée (Éq.~7) :
+\begin{equation}\label{eq:obj7}
+J=\sum_{(u,i)\in\mathcal{R}} w_{ui}(r_{ui}-\hat r_{ui})^2
++\sum_{u=1}^{M}\sum_{i\notin\mathcal{R}_u} c_i\,\hat r_{ui}^{\,2}
++\lambda\Big(\textstyle\sum_u\|\mathbf p_u\|^2+\sum_i\|\mathbf q_i\|^2\Big).
+\end{equation}
+
+\paragraph{Le poids des articles non vus (Éq.~8).} C'est ici que se situe l'apport de
+l'article. Le poids accordé à une case vide de la colonne $i$ vaut
+\begin{equation}\label{eq:ci}
+c_i \;=\; c_0\,\frac{f_i^{\alpha}}{\sum_{j=1}^{N} f_j^{\alpha}},
+\qquad f_i=\frac{|\mathcal{R}_i|}{\sum_{j}|\mathcal{R}_j|},
+\end{equation}
+où $f_i$ est la fréquence de l'article $i$. La formule a une propriété commode : quelle
+que soit la valeur de $\alpha$, la somme des $c_i$ vaut toujours $c_0$. Les deux
+paramètres ont donc des rôles bien séparés. $c_0$ fixe l'importance \emph{totale}
+accordée aux cases vides, et $\alpha$ décide seulement de la façon de la répartir entre
+les articles.
+
+Deux cas limites éclairent le mécanisme. Avec $\alpha=0$, tous les articles reçoivent le
+même poids et l'on retrouve exactement la méthode de Hu et al. Avec $\alpha>0$, les
+articles populaires en reçoivent davantage : ne pas avoir vu un film à succès pèse plus
+lourd dans l'apprentissage que ne pas avoir vu un film obscur. Sur Amazon Movies, le
+rapport entre le plus fort et le plus faible poids passe de $1$ à $\alpha=0$ à environ
+$16$ à $\alpha=0{,}4$, la valeur retenue par l'article. Cette redistribution fait tout
+l'intérêt de la méthode, et aussi, comme nous le verrons en
+Section~\ref{sec:discussion}, tout son risque.
+
+\subsection{Dériver la mise à jour élément par élément}
+
+Cette sous-section refait le calcul qui mène à la règle de mise à jour. Elle mérite
+d'être suivie, car c'est elle qui fait apparaître l'astuce sur laquelle repose toute
+l'efficacité de la méthode - et, plus loin, toute la parallélisation.
+
+Le principe est simple : on fixe tous les paramètres sauf un, et on cherche la valeur
+optimale de celui-là. Comme la fonction à minimiser est un polynôme du second degré en
+ce paramètre, il suffit d'annuler la dérivée pour obtenir directement l'optimum. Pas de
+pas d'apprentissage, pas de tâtonnement.
+
+Notons $\hat r^{\,f}_{ui}=\hat r_{ui}-p_{uf}q_{if}$ la prédiction \emph{privée de la
+contribution du facteur $f$}. En dérivant~\eqref{eq:obj} par rapport à la seule
+coordonnée $p_{uf}$ :
+\begin{equation}
+\frac{\partial J}{\partial p_{uf}}
+= -2\sum_{i=1}^{N}\big(r_{ui}-\hat r^{\,f}_{ui}\big)w_{ui}q_{if}
++ 2\,p_{uf}\sum_{i=1}^{N} w_{ui}q_{if}^2 + 2\lambda p_{uf}.
+\end{equation}
+En l'annulant on obtient la solution élément par élément générique (Éq.~5)
+\begin{equation}\label{eq:eq5}
+p_{uf}=\frac{\sum_{i=1}^{N}\big(r_{ui}-\hat r^{\,f}_{ui}\big)w_{ui}q_{if}}
+             {\sum_{i=1}^{N} w_{ui}q_{if}^2+\lambda},
+\end{equation}
+Cette formule est exacte, mais inutilisable telle quelle : les sommes portent sur les
+$N$ articles du catalogue, pour \emph{chaque} utilisateur et \emph{chaque} facteur. On
+parcourrait donc tout le tableau vide à chaque itération, soit $O(MNK)$ opérations. Sur
+Amazon Movies, cela représente $23$ milliards de termes par itération, alors que seules
+$10^6$ cases contiennent une information.
+
+Toute l'astuce consiste à ne jamais parcourir ces cases vides. Séparons la somme en deux
+parties, les cases observées et les autres, en utilisant $r_{ui}=0$ et $w_{ui}=c_i$ sur
+les secondes :
+\begin{equation}\label{eq:split}
+p_{uf}=\frac{\sum_{i\in\mathcal{R}_u}(r_{ui}-\hat r^{\,f}_{ui})w_{ui}q_{if}
+             \;-\;\sum_{i\notin\mathcal{R}_u}\hat r^{\,f}_{ui}\,c_i q_{if}}
+            {\sum_{i\in\mathcal{R}_u} w_{ui}q_{if}^2
+             +\sum_{i\notin\mathcal{R}_u} c_i q_{if}^2+\lambda}.
+\end{equation}
+Les deux sommes sur les cases vides ($i\notin\mathcal{R}_u$) restent le goulot
+d'étranglement. L'idée décisive est de les réécrire par complément : \emph{tous les
+articles, moins ceux que l'utilisateur a vus}. Le premier terme ne dépend alors plus de
+l'utilisateur, et le second ne porte que sur les quelques articles réellement observés.
+Pour le numérateur, en développant $\hat r^{\,f}_{ui}=\sum_{k\neq f}p_{uk}q_{ik}$ :
+\begin{align}
+\sum_{i\notin\mathcal{R}_u}\hat r^{\,f}_{ui}c_iq_{if}
+&=\sum_{i=1}^{N} c_iq_{if}\sum_{k\neq f}p_{uk}q_{ik}
+ -\sum_{i\in\mathcal{R}_u}\hat r^{\,f}_{ui}c_iq_{if} \nonumber\\
+&=\sum_{k\neq f}p_{uk}\underbrace{\sum_{i=1}^{N} c_i q_{if}q_{ik}}_{\textstyle s^q_{kf}}
+ -\sum_{i\in\mathcal{R}_u}\hat r^{\,f}_{ui}c_iq_{if},
+\label{eq:num}
+\end{align}
+et pour le dénominateur, $\sum_{i\notin\mathcal{R}_u}c_iq_{if}^2
+= s^q_{ff}-\sum_{i\in\mathcal{R}_u}c_iq_{if}^2$. L'observation cruciale est que la
+matrice $K\times K$
+\begin{equation}\label{eq:sq}
+S^q \;=\; \sum_{i=1}^{N} c_i\,\mathbf q_i\mathbf q_i^{\top}
+\end{equation}
+ne dépend pas de l'utilisateur $u$. C'est le point clé de toute la méthode : cette
+petite matrice $K\times K$ (soit $32\times32$ en pratique) résume à elle seule la
+contribution des millions de cases vides. On la calcule \emph{une seule fois} par
+itération, puis on la réutilise pour les $M$ utilisateurs. Le coût des données
+manquantes passe ainsi de « proportionnel au catalogue » à « constant ».
+
+En reportant~\eqref{eq:num} dans~\eqref{eq:split}, on obtient la règle effectivement
+implémentée :
+\begin{equation}\label{eq:pu}
+\boxed{\;p_{uf}\leftarrow
+\frac{\displaystyle\sum_{i\in\mathcal{R}_u}\!\big[w_{ui}r_{ui}-(w_{ui}-c_i)\hat r^{\,f}_{ui}\big]q_{if}
+-\sum_{k\neq f}p_{uk}\,s^q_{kf}}
+{\displaystyle\sum_{i\in\mathcal{R}_u}(w_{ui}-c_i)q_{if}^2+s^q_{ff}+\lambda}\;}
+\end{equation}
+Aucune somme ne porte plus sur les $N$ articles : elles portent sur les interactions
+réelles de l'utilisateur, ou sur les $K$ facteurs. C'est ce qui rend la méthode
+utilisable.
+
+\paragraph{Côté article.} Le calcul est symétrique, avec une différence utile : le poids
+$c_i$ ne dépend que de l'article, il peut donc sortir de la somme. Avec
+$S^p=P^{\top}P$ le second cache (non pondéré, cette fois) :
+\begin{equation}\label{eq:qi}
+\boxed{\;q_{if}\leftarrow
+\frac{\displaystyle\sum_{u\in\mathcal{R}_i}\!\big[w_{ui}r_{ui}-(w_{ui}-c_i)\hat r^{\,f}_{ui}\big]p_{uf}
+-c_i\sum_{k\neq f}q_{ik}\,s^p_{kf}}
+{\displaystyle\sum_{u\in\mathcal{R}_i}(w_{ui}-c_i)p_{uf}^2+c_i\,s^p_{ff}+\lambda}\;}
+\end{equation}
+C'est l'Éq.~(13) de l'article.
+
+Cette réécriture est une optimisation, et une optimisation peut être fausse. Avant
+d'écrire la moindre ligne de Spark, nous avons donc comparé les deux règles encadrées à
+la formule naïve~\eqref{eq:eq5}, évaluée littéralement sur \emph{toutes} les cases d'un
+problème jouet de taille $20\times15$ - assez petit pour que le calcul brut soit
+possible. L'écart maximal est de l'ordre de $10^{-16}$, c'est-à-dire la précision d'un
+nombre flottant. La mise en cache est donc une réécriture exacte, pas une
+approximation.
+
+\paragraph{Suivre la convergence sans tout recalculer.} Le même problème se pose pour
+vérifier que le modèle progresse : évaluer~\eqref{eq:obj7} directement coûterait à
+nouveau $O(MNK)$. La même astuce s'applique (Éq.~14 de l'article) :
+\begin{equation}\label{eq:objfast}
+\sum_{u}\sum_{i\notin\mathcal{R}_u} c_i\hat r_{ui}^2
+=\sum_{u=1}^{M}\mathbf p_u^{\top}S^q\mathbf p_u-\sum_{(u,i)\in\mathcal{R}}c_i\hat r_{ui}^2,
+\end{equation}
+ce qui ramène le coût à $O(|\mathcal{R}|+MK^2)$, donc au même ordre qu'une itération.
+C'est ce que calcule \texttt{eals\_local.objective}, et c'est ainsi que nous vérifions
+la convergence.
+
+\subsection{Complexité}
+
+\begin{table}[h]
+\centering\small
+\caption{Coût d'une itération. $|\mathcal{R}|$ est le nombre d'interactions observées,
+$M$ le nombre d'utilisateurs, $N$ celui d'articles et $K$ celui de
+facteurs.}\label{tab:complexity}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Méthode & Temps par itération & Poids des cases vides \\
+\midrule
+ALS, Hu et al.~\cite{hu2008implicit} & $O((M+N)K^3+|\mathcal{R}|K^2)$ & uniforme seulement \\
+Formule naïve~\eqref{eq:eq5}         & $O(MNK)$                       & quelconque \\
+\textbf{eALS}~\cite{he2016eals}      & $O((M+N)K^2+|\mathcal{R}|K)$   & un poids $c_i$ par article \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Le décompte est direct. Pour un utilisateur donné et un facteur donné, le terme faisant
+intervenir le cache coûte $O(K)$ et les sommes sur les interactions observées coûtent
+$O(|\mathcal{R}_u|)$. En sommant sur les $K$ facteurs et les $M$ utilisateurs, une étape
+revient à $O(MK^2+|\mathcal{R}|K)$, et le calcul des caches ajoute $O((M+N)K^2)$.
+
+La conclusion pratique tient en une phrase : eALS est un facteur $K$ moins cher qu'ALS,
+et son coût doit croître comme le \emph{carré} du nombre de facteurs plutôt que comme
+son \emph{cube}. C'est une prédiction vérifiable, et la Section~\ref{sec:factors} la
+met à l'épreuve.
+
+\subsection{Distribuer une itération}\label{sec:algodist}
+
+\begin{figure}[h]
+\centering
+\begin{minipage}{0.97\textwidth}
+\begin{lstlisting}[language=,basicstyle=\ttfamily\small,numbers=none,frame=single,
+                   escapechar=@,caption={},captionpos=b,label={lst:alg}]
+entrée : P, Q sur le driver ; c diffuse une fois pour toutes
+         U_1..U_B partitionnent les utilisateurs, I_1..I_B partitionnent les items
+
+ 0  avant la boucle :  S^q <- somme_i c_i q_i q_i^T  ;  bcP <- broadcast(P)
+    (les seules fois ou ces deux objets sont calcules hors des taches)
+
+ 1  bcQ <- broadcast(Q)
+ 2  pour chaque bloc b, EN PARALLELE :                      # etape utilisateur
+ 3      P_b <- lignes U_b de bcP
+ 4      pour f = 1..K :  mettre a jour p_uf pour TOUS les u de U_b  -- Eq.(12), vectorise sur u
+ 5      emettre (U_b, P_b, P_b^T P_b)
+ 6  collecter ; disperser les P_b dans P ;  S^p <- somme_b P_b^T P_b     # cache, gratuit
+ 7  bcP <- broadcast(P)
+ 8  pour chaque bloc b, EN PARALLELE :                      # etape item
+ 9      Q_b <- lignes I_b de bcQ
+10      pour f = 1..K :  mettre a jour q_if pour TOUS les i de I_b  -- Eq.(13), vectorise sur i
+11      emettre (I_b, Q_b, somme_{i in I_b} c_i q_i q_i^T)
+12  collecter ; disperser les Q_b dans Q ;  S^q <- somme_b (.)  # cache pour l'iteration suivante
+\end{lstlisting}
+\end{minipage}
+\caption{Une itération eALS distribuée (\texttt{eals\_rdd.fit}). Les lignes 5 et 11
+sont ce qui fait que les deux caches $S$ de l'Algorithme~1 de l'article ne coûtent
+rien : chaque tâche de mise à jour renvoie la matrice de Gram des lignes qu'elle vient
+d'écrire.}\label{alg:dist}
+\end{figure}
+
+Trois choix de conception méritent d'être détaillés.
+
+\paragraph{La parallélisation ne perd aucune précision.} C'est l'affirmation centrale
+de l'article, et elle se justifie simplement. Pendant l'étape utilisateur, $Q$ et le
+cache $S^q$ ne sont que \emph{lus} ; les seules valeurs \emph{écrites} par un bloc sont
+les facteurs de ses propres utilisateurs, auxquels aucun autre bloc ne touche. Il n'y a
+donc jamais deux machines qui modifient la même case.
+
+Le résultat distribué est par conséquent identique au résultat séquentiel, à l'ordre
+d'addition des nombres flottants près. C'est une propriété rare : la descente de
+gradient stochastique distribuée, par exemple, ne l'a pas, car des mises à jour
+concurrentes s'y écrasent mutuellement. La Section~\ref{sec:correctness} vérifie
+l'affirmation numériquement.
+
+\paragraph{Les caches sont obtenus gratuitement.} Une implémentation naïve recalculerait
+$S^q$ et $S^p$ en parcourant à nouveau toutes les lignes de facteurs, soit deux passes
+supplémentaires par itération. Nous procédons autrement : chaque tâche renvoie, en même
+temps que ses facteurs mis à jour, la contribution partielle des lignes qu'elle vient
+d'écrire (lignes 5 et 11 du pseudo-code). Le driver n'a plus qu'à additionner ces
+morceaux. Le cache est donc un sous-produit du calcul, et le surcoût réseau est
+négligeable : quelques matrices $K\times K$, soit environ 131\,ko par étape.
+
+\paragraph{Le parallélisme est entre utilisateurs, pas entre facteurs.} La boucle sur
+les $K$ facteurs ne peut pas être parallélisée : le facteur $f+1$ doit voir la valeur
+mise à jour du facteur $f$, sinon on ne résout plus le bon problème. En revanche, rien
+n'empêche de traiter le facteur $f$ de \emph{tous} les utilisateurs d'un bloc en même
+temps, puisqu'ils sont indépendants. C'est exactement ce que fait notre noyau, et cela
+change l'échelle du problème : la boucle Python s'exécute $K$ fois par étape au lieu de
+$M\times K$ fois. La Section~\ref{sec:code} montre le code correspondant.
+
+%==========================================================================
+\section{Commentaire sur les principaux fragments de code}\label{sec:code}
+%==========================================================================
+
+Cette section commente les quelques fragments de code où se joue quelque chose de non
+trivial. Le code complet figure en Annexe~\ref{app:code}.
+
+\subsection{Le noyau de calcul}
+
+C'est le cœur du projet : une vingtaine de lignes qui appliquent la règle~\eqref{eq:pu}
+non pas à un utilisateur, mais à un bloc entier d'utilisateurs d'un seul coup.
+
+\begin{lstlisting}[caption={\texttt{eals\_local.update\_users} - Éq.~\eqref{eq:pu},
+vectorisée sur les utilisateurs d'un bloc.},label={lst:kernel}]
+def update_users(PT, QT, idx, rowid, cvec, Sq, lam, w=1.0, rhat=None):
+    K, m = PT.shape
+    c_e = cvec[idx]
+    wmc = w - c_e                       # (w_ui - c_i)
+    wr  = w * 1.0                       # w_ui * r_ui, r_ui = 1
+    if rhat is None:
+        rhat = _predict(PT, QT, rowid, idx)
+    for f in range(K):
+        qf = QT[f][idx]
+        rhat -= PT[f][rowid] * qf       # r_hat^f = r_hat - p_uf q_if
+        num = np.bincount(rowid, (wr - wmc * rhat) * qf, minlength=m)
+        den = np.bincount(rowid, wmc * qf * qf,          minlength=m)
+        num -= Sq[:, f] @ PT - PT[f] * Sq[f, f]     # - sum_{k!=f} p_uk s^q_kf
+        den += Sq[f, f] + lam
+        PT[f] = num / den
+        rhat += PT[f][rowid] * qf
+    return rhat
+\end{lstlisting}
+
+\begin{itemize}\itemsep3pt
+\item \textbf{Le code suit la formule terme à terme.} \texttt{num} est le numérateur
+de~\eqref{eq:pu} et \texttt{den} son dénominateur. La ligne
+\texttt{Sq[:,f] @ PT - PT[f]*Sq[f,f]} calcule la somme sur les facteurs autres que $f$ :
+on somme sur tous les facteurs, puis on retranche le terme en trop, ce qui est plus
+rapide que de construire une matrice trouée.
+\item \textbf{\texttt{np.bincount} fait tout le travail.} C'est la fonction qui permet
+de calculer, en une seule passe, une somme séparée pour chaque utilisateur du bloc.
+C'est elle qui rend possible le traitement simultané de tout un bloc, au lieu d'une
+boucle Python par utilisateur.
+\item \textbf{Les facteurs sont stockés transposés.} La boucle interne accède à un
+facteur entier à la fois. En rangeant la matrice dans l'autre sens, chaque accès serait
+dispersé en mémoire au lieu d'être contigu, ce qui coûte cher sur des tableaux de cette
+taille.
+\item \textbf{Les prédictions sont mises à jour, jamais recalculées.} Le tableau
+\texttt{rhat} contient les prédictions courantes. À chaque facteur, on retire sa
+contribution (\texttt{rhat -= ...}), on l'utilise, puis on rajoute la nouvelle
+(\texttt{rhat += ...}). Sans cette mise à jour incrémentale, il faudrait recalculer
+chaque prédiction depuis zéro, ce qui multiplierait le coût par $K$.
+\item \textbf{Aucun grand tableau intermédiaire n'est créé.} Rassembler d'un coup les
+facteurs de toutes les interactions demanderait 2,5\,Go sur ml-10m. Nous récupérons une
+colonne à la fois, ce qui ramène le besoin mémoire au nombre d'interactions, sans
+changer le volume total de calcul.
+\end{itemize}
+
+\subsection{Construire les blocs une seule fois}
+
+\begin{lstlisting}[caption={\texttt{eals\_rdd.build\_blocks} - un élément RDD par
+partition, contenant le bloc sous forme de tableaux NumPy.},label={lst:blocks}]
+def build_blocks(df, key, val, n_parts):
+    def to_arrays(it):
+        ks, vs = [], []
+        for k, v in it:
+            ks.append(k); vs.append(v)
+        ks = np.asarray(ks, dtype=np.int64); vs = np.asarray(vs, dtype=np.int64)
+        ids, rowid = np.unique(ks, return_inverse=True)
+        o = np.argsort(rowid, kind="stable")
+        return iter([(ids, rowid[o].astype(np.int64), vs[o])])
+
+    rdd = df.select(key, val).rdd.map(lambda r: (r[0], r[1]))
+    return rdd.partitionBy(n_parts).mapPartitions(to_arrays, preservesPartitioning=True)
+\end{lstlisting}
+
+\begin{itemize}\itemsep3pt
+\item \textbf{Les données ne sont réparties qu'une seule fois.} On regroupe les
+interactions par utilisateur une fois pour toutes, et on garde le résultat en mémoire.
+Refaire ce regroupement à chaque itération obligerait Spark à redéplacer toutes les
+interactions sur le réseau à chaque fois. Sur ml-10m, c'est la différence entre une
+itération de 4 secondes et une de 40.
+\item \textbf{Un bloc entier tient dans un seul objet.} Chaque partition est réduite à
+trois tableaux NumPy, plutôt qu'à un objet Python par utilisateur. Sur ml-10m, la
+seconde option ferait payer le coût des objets Python 70\,000 fois par étape, contre une
+poignée de fois ici.
+\item \textbf{Les interactions sont triées à la construction.} Le tri rend les accès
+mémoire séquentiels dans la boucle de calcul, au lieu de sauter au hasard dans le
+tableau des facteurs.
+\item \textbf{Les utilisateurs les plus actifs sont répartis entre les blocs.} Les
+identifiants sont attribués par fréquence décroissante, de sorte que la répartition par
+défaut disperse les gros utilisateurs au lieu de les entasser dans le même bloc.
+L'enjeu est réel : sur ml-10m, l'utilisateur le plus actif a 7\,063 interactions contre
+68 pour l'utilisateur médian. Un bloc qui en concentrerait plusieurs ferait attendre
+tous les autres.
+\end{itemize}
+
+\subsection{Diffusion du modèle et localisation de l'état}
+
+\begin{lstlisting}[caption={\texttt{eals\_rdd.fit} - le corps d'une itération.},label={lst:iter}]
+bcQ = sc.broadcast(QT)
+res = ublocks.map(lambda b: _user_task(b, bcP, bcQ, bcC, lam, w, Squ)).collect()
+Sp = np.zeros((K, K))
+for ids, blk, sp in res:
+    PT[:, ids] = blk          # disperser le bloc dans la matrice de facteurs complète
+    Sp += sp                  # ... et accumuler le cache S^p gratuitement
+bcP.unpersist(); bcP = sc.broadcast(PT)
+res = iblocks.map(lambda b: _item_task(b, bcP, bcQ, bcC, lam, w, Sp)).collect()
+\end{lstlisting}
+
+\begin{itemize}\itemsep3pt
+\item \textbf{Deux diffusions par itération, pas quatre.} La matrice $Q$ est envoyée une
+fois en début d'itération et sert aux \emph{deux} étapes ; $P$ est envoyée après l'étape
+utilisateur et resservira à l'itération suivante. Le détail compte, car chaque machine
+doit décompresser sa copie : une diffusion inutile se paie autant de fois qu'il y a de
+processus.
+\item \textbf{Libérer explicitement les copies diffusées.} Spark ne récupère pas
+automatiquement la mémoire d'une variable diffusée lorsqu'on cesse de s'en servir. Sans
+l'appel explicite à \texttt{unpersist}, le driver accumule une copie de $P$ par
+itération et finit par saturer.
+\item \textbf{Le modèle ne vit pas dans Spark.} Les facteurs sont un simple tableau
+NumPy côté driver ; Spark ne sert qu'à distribuer le calcul, pas à stocker l'état. C'est
+un choix délibéré, et il évite le piège décrit au fragment suivant.
+\item \textbf{C'est aussi la limite de la conception.} Le modèle entier doit tenir sur
+le driver, et chaque processus de calcul doit pouvoir en garder une copie. À $10^8$
+utilisateurs et $K=128$, cela ferait 100\,Go et l'approche s'effondrerait. La réponse à
+cette échelle serait le schéma par jointures évoqué en Section~\ref{sec:solution}.
+\end{itemize}
+
+\subsection{Croissance du plan d'exécution dans une boucle Spark}\label{sec:lineage}
+
+Spark ne calcule rien tant qu'on ne lui demande pas de résultat : il se contente
+d'enregistrer la recette des opérations. C'est efficace, sauf dans une boucle, où la
+recette s'allonge à chaque tour. La boucle d'entraînement y échappe, puisque le modèle
+n'y est pas stocké. La préparation des données, elle, n'y échappe pas : le filtrage
+10-core est une boucle de jointures, et c'est là que le problème s'est manifesté.
+
+\begin{lstlisting}[caption={\texttt{data.kcore} - la ligne qui permet à une boucle de
+jointures Spark de survivre.},label={lst:kcore}]
+nxt = df.join(ok_u, "user").join(ok_i, "item").select("user", "item", "ts")
+# localCheckpoint, pas cache : cache() garde le plan logique vivant, donc apres ~8
+# tours le plan est assez profond pour que Spark meure en *affichant* le plan
+# (TreeNode.generateTreeString). Le checkpoint tronque la lignee en un simple scan
+# des lignes materialisees.
+nxt = nxt.localCheckpoint(eager=True)
+df.unpersist()
+df = nxt
+\end{lstlisting}
+
+\begin{itemize}\itemsep3pt
+\item \textbf{Mettre en cache ne suffit pas.} On pourrait croire qu'un \texttt{cache()}
+règle le problème. Il matérialise bien les \emph{données}, mais Spark conserve la
+recette complète, au cas où il devrait tout recalculer. Elle continue donc de
+s'allonger, et le driver finit par passer plus de temps à préparer le calcul que les
+machines à l'exécuter. \texttt{localCheckpoint} coupe court en remplaçant la recette par
+une simple lecture des données déjà calculées.
+\item \textbf{Le symptôme est trompeur.} Sur Amazon Movies, après environ huit tours de
+filtrage, le driver s'arrêtait sur une erreur de mémoire saturée. Or ce n'est pas en
+traitant les données que Spark manquait de mémoire, mais en \emph{affichant} la recette
+devenue gigantesque. Cela ressemble à un problème de volume de données ; c'en est un de
+taille de plan d'exécution.
+\item \textbf{La leçon générale.} Dans une boucle Spark, il faut périodiquement couper
+l'historique des opérations. Notre boucle d'entraînement y échappe seulement parce que
+le modèle vit en dehors de Spark, ce qui est précisément le choix de la
+Section~\ref{sec:algodist}.
+\end{itemize}
+
+\subsection{Environnement d'exécution des processus distants}
+
+Le notebook de l'Annexe~\ref{app:nb} importe les modules en ajoutant \texttt{../src}
+à \texttt{sys.path}. Cela fonctionne sur le driver et échoue sur les workers :
+
+\begin{lstlisting}[caption={\texttt{spark\_utils.get\_spark} - trois lignes sans
+lesquelles rien ne fonctionne en dehors de \texttt{src/}.}]
+src = os.path.dirname(os.path.abspath(__file__))
+if src not in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+    os.environ["PYTHONPATH"] = os.pathsep.join(
+        [src] + [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p])
+\end{lstlisting}
+
+Les processus de calcul lancés par Spark sont des processus Python distincts. Ils
+n'héritent pas des chemins d'import du programme principal : tout code envoyé sur un
+worker et qui importe nos modules échoue donc avec un \texttt{ModuleNotFoundError}.
+L'erreur est d'autant plus déroutante qu'elle survient à l'intérieur d'une tâche
+distante et remonte enfouie sous plusieurs traces de pile Java.
+
+La correction tient en trois lignes : les processus héritent en revanche des variables
+d'environnement, il suffit donc d'y inscrire le chemin du code avant de démarrer Spark.
+Nos scripts ne rencontraient jamais le problème, car ils s'exécutent depuis le dossier
+\texttt{src/} ; le notebook, lancé depuis un autre dossier, l'a rencontré
+immédiatement. C'est typiquement le genre de bug qu'un environnement de développement
+unique dissimule jusqu'au jour où quelqu'un d'autre exécute le code.
+
+\subsection{Évaluer sans construire la matrice des scores}
+
+Pour évaluer le modèle, il faut classer l'article de test de chaque utilisateur parmi
+\emph{tout} le catalogue. Calculer tous ces scores d'un coup demanderait 5,8\,Go sur
+Amazon Movies. Les calculer un utilisateur à la fois en Python prendrait des minutes.
+Nous procédons par blocs de 256 utilisateurs, ce qui ramène le tout à une seule
+multiplication de matrices par bloc :
+
+\begin{lstlisting}[caption={\texttt{evaluate.\_block\_eval} - classement sur le
+catalogue entier, par blocs.}]
+S = P[us] @ Q.T                       # (256, N) - un seul GEMM, pas 256 produits scalaires
+for b, r in enumerate(buf):
+    S[b, np.asarray(r[1])] = -np.inf  # masquer les items d'entrainement de cet utilisateur
+st   = S[np.arange(len(buf)), tis].copy()
+rank = (S > st[:, None]).sum(1) + 1   # rang (base 1) de l'item verite-terrain
+\end{lstlisting}
+
+La taille du bloc plafonne la mémoire à 45\,Mo au lieu de 5,8\,Go, et l'évaluation est
+elle aussi distribuée : les utilisateurs sont répartis entre les cœurs comme le reste du
+calcul.
+
+\input{sec_experiments}
+\input{sec_discussion}
+\input{sec_conclusion}
+
+%==========================================================================
+\section*{Déclaration sur l'usage d'outils d'assistance}
+%==========================================================================
+\addcontentsline{toc}{section}{Déclaration sur l'usage d'outils d'assistance}
+\noindent
+La rédaction de ce rapport et l'écriture du code ont bénéficié de l'assistance d'un
+modèle de langage. Les mesures rapportées proviennent de nos propres exécutions sur la
+machine décrite en Section~\ref{sec:setup} ; les fichiers CSV bruts sont versionnés dans
+\texttt{results/} et l'ensemble des figures, tableaux et chiffres du rapport en est
+regénéré par \texttt{scripts/build\_report.sh}.
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\input{sec_appendix}
+
+\end{document}

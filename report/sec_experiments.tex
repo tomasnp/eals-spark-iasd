@@ -1,0 +1,336 @@
+
+%==========================================================================
+\section{Analyse expérimentale}\label{sec:exp}
+%==========================================================================
+
+Chaque chiffre ci-dessous est produit par \texttt{src/experiments.py}, stocké en CSV
+brut dans \texttt{results/}, puis transformé en figure par \texttt{src/plots.py} et en
+tableau LaTeX par \texttt{report/tables.py}. Aucun chiffre de ce rapport n'est saisi à
+la main. Le matériel et les deux pièges de configuration sont décrits en
+Section~\ref{sec:setup} ; sauf mention contraire $K=32$, $\lambda=0,01$, $c_0=512$,
+$\alpha=0,4$, graine 42, et 3 répétitions de 4 itérations dont la première est
+écartée comme échauffement. La ligne de commande exacte de chaque exécution figure
+dans \texttt{scripts/run\_all.sh}.
+
+\paragraph{Avertissement sur la comparabilité des mesures.} Toute la campagne est une
+séquence de jobs à 8 cœurs sur un ordinateur portable, et un portable
+sous charge soutenue ne maintient pas une horloge constante. Nous avons mesuré la
+conséquence plutôt que de la balayer d'un revers de main : la même configuration
+ré-exécutée une heure plus tard, après un voisin plus lourd, est ressortie jusqu'à
+deux fois plus lente. Nous attribuons cela à une combinaison de limitation thermique
+(\emph{throttling}) et de workers JVM/Python froids dans chaque \texttt{SparkSession}
+nouvellement créée, et nous n'avons pas cherché à séparer les deux effets. La règle
+pratique que nous avons suivie, et que le lecteur devrait appliquer en lisant les
+tableaux : \textbf{chaque conclusion ci-dessous est tirée d'un rapport calculé
+\emph{à l'intérieur} d'un seul appel d'expérience} - une accélération, un facteur de
+croissance, un rapport entre méthodes - et jamais de secondes absolues comparées
+entre deux appels. Là où une expérience aurait sinon été exposée à cette dérive, elle
+a été ré-exécutée avec les répétitions entrelacées entre configurations et un temps de
+repos entre elles (\texttt{--interleave}, \texttt{--cooldown}).
+
+%--------------------------
+\subsection{Exactitude de la parallélisation}\label{sec:correctness}
+%--------------------------
+
+Rien d'autre dans cette section n'a de sens si le code distribué ne calcule pas eALS.
+Deux vérifications sont effectuées, dans cet ordre. D'abord, les règles de mise à jour
+elles-mêmes sont comparées à une évaluation littérale en $O(MNK)$ de
+l'Éq.~\eqref{eq:eq5} sur une matrice jouet, qui concorde à $3\cdot10^{-16}$ près
+(Section~\ref{sec:algo}). Ensuite - le tableau ci-dessous - l'implémentation
+distribuée est comparée à la référence séquentielle. La Section~\ref{sec:algo} a
+argumenté que le découpage en blocs ne peut pas changer le résultat ; ici nous le
+vérifions. L'implémentation RDD est exécutée sur ml-100k avec la même graine, $K=8$ et
+5 itérations, pour 1, 2, 4 et 8 blocs, et comparée entrée par entrée à la référence
+NumPy séquentielle.
+
+\begin{table}[htbp]
+\centering\small
+\caption{Contrôle d'exactitude (\texttt{check\_correctness.py}, ml-100k, $K=8$, 5
+itérations). « blocs » est le nombre de partitions Spark. L'objectif est
+l'Éq.~\eqref{eq:obj7} évaluée via l'Éq.~\eqref{eq:objfast}.}\label{tab:correctness}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Implémentation & blocs & $\max|\Delta P|$ & $\max|\Delta Q|$ & Objectif $J$ & err.\ rel. \\
+\midrule
+\inputrows{tables/tab_correctness.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
+Deux observations. Avec un seul bloc, l'exécution Spark est \textbf{identique au bit
+près} à la référence NumPy - la même arithmétique dans le même ordre. Avec 2, 4 ou 8
+blocs, l'écart est de $\CorrWorst$, soit quelques unités du dernier chiffre d'un
+double : la seule chose qui change est l'ordre dans lequel les sommes partielles de
+$S^p$ et $S^q$ sont accumulées. L'objectif concorde à une erreur relative inférieure à
+$10^{-15}$. C'est la forme empirique de l'affirmation de l'article selon laquelle eALS
+est trivialement parallélisable \emph{sans perte d'approximation}, et cela signifie
+aussi que chaque mesure de temps ci-dessous mesure le même calcul.
+
+%--------------------------
+\subsection{Scalabilité}\label{sec:scal}
+%--------------------------
+
+\subsubsection{Scalabilité forte}\label{sec:strong}
+
+Données fixes, ressources croissantes : \texttt{local[1]}, \texttt{local[2]},
+\texttt{local[4]}, \texttt{local[8]}, avec un nombre de partitions maintenu
+proportionnel au nombre de cœurs pour que le travail par tâche reste constant.
+
+\begin{figure}[htbp]\centering
+\figplot{strong_scaling}{0.98\textwidth}
+\caption{Scalabilité forte sur ml-1m ($10^6$ interactions) et ml-10m ($10^7$). Les
+barres d'erreur sont le min--max sur 9 échantillons par itération. Pointillés :
+l'accélération linéaire idéale ; tirets : la courbe d'Amdahl ajustée à chaque jeu de
+données.}\label{fig:strong}
+\end{figure}
+
+\begin{table}[htbp]
+\centering\small
+\caption{Scalabilité forte, $K=32$, partitions $=2\times$ cœurs.}\label{tab:strong}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Cœurs $p$ & médiane s/itér. & min--max & accélération $S(p)$ & efficacité $E(p)$ \\
+\midrule
+\inputrows{tables/tab_strong.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Méthodologie.} Le nombre de blocs croît avec le nombre de cœurs ($B=2p$),
+de sorte que le travail par tâche reste constant - ce que l'on ferait en production.
+La contrepartie, qui compte pour la lecture des chiffres, est que la surcharge totale
+par tâche croît elle aussi avec $p$ : à $p=8$ l'exécution paie seize surcharges de
+bloc contre deux à $p=1$, ce qui \emph{sous-estime} l'accélération. Les répétitions
+sont \emph{entrelacées} - la boucle externe est la répétition, la boucle interne le
+nombre de cœurs - afin que la lente dérive thermique d'un portable sous une campagne
+prolongée ne retombe pas entièrement sur la configuration exécutée en dernier. Nous
+avons constaté que cela comptait : dans une première exécution non entrelacée, le point
+à 8 cœurs a produit un unique échantillon de 19,7\,s contre une médiane de 8,8\,s.
+
+\paragraph{Interprétation de l'ajustement d'Amdahl.} En suivant Amdahl~\cite{amdahl1967},
+nous ajustons $T(p)=a+b/p$ par moindres carrés et rapportons $s=a/(a+b)$, la fraction
+d'une itération à un cœur qui ne bénéficie pas de cœurs supplémentaires. Ajuster le
+modèle directement est plus robuste que de lire $s$ sur le point à 8 cœurs, qui est
+exactement le point le plus exposé à la contention mémoire.
+
+\paragraph{Résultats.} L'exécution de référence - ml-10m, répétitions
+entrelacées - atteint $S(8)=\SpeedupBig\times$ sur un possible $8\times$, une
+efficacité de $26\,\%$, avec une fraction série d'Amdahl ajustée de $\SerialBig$. Sur
+ml-1m, où les données sont dix fois plus petites et où le coût fixe d'une itération en
+représente une part bien plus grande, $S(8)=\SpeedupSmall\times$ et $s=\SerialSmall$.
+Les deux courbes s'aplatissent entre 4 et 8 cœurs : le quatrième cœur rapporte encore
+quelque chose, le huitième pratiquement pas.
+
+\paragraph{Origine de la fraction non parallélisable.} Quatre choses ne se réduisent pas quand $p$
+croît :
+\begin{itemize}\itemsep2pt
+\item \textbf{La désérialisation des broadcasts}, payée une fois par worker Python et
+par broadcast, et donc \emph{croissante} avec $p$. C'est le terme dominant, et il est
+invisible dans toute décomposition mesurée côté driver : \texttt{sc.broadcast} n'écrit
+le tableau qu'une fois, tandis que la moitié coûteuse - la désérialisation - se
+produit dans chaque worker Python et est imputée à la tâche, pas au driver.
+\item \textbf{La colle côté driver} : créer les broadcasts, disperser $2\times$ $B$
+blocs dans $P$ et $Q$, réduire les partiels de Gram.
+\item \textbf{La soumission des jobs et l'ordonnancement des tâches}, $2B$ tâches par
+itération.
+\item \textbf{La bande passante mémoire}, qui n'est pas du tout du travail série mais
+se comporte comme tel : le noyau est un flux de gathers et de sommes par segment sur
+des tableaux bien plus grands que le L2, et les huit cœurs d'un portable série M
+partagent un seul contrôleur mémoire. C'est pourquoi le plafond est une propriété de
+la machine plutôt que du code, et pourquoi un cluster de huit nœuds à un cœur
+paraîtrait meilleur qu'un seul nœud à huit cœurs.
+\end{itemize}
+
+\subsubsection{Scalabilité en nombre de facteurs latents}\label{sec:factors}
+
+C'est l'expérience qui décide si l'affirmation centrale de l'article survit au contact
+d'une implémentation réelle. Par itération, eALS coûte
+$O\big((M{+}N)K^2+|\mathcal{R}|K\big)$ et ALS $O\big((M{+}N)K^3+|\mathcal{R}|K^2\big)$.
+Lire cela comme « $K^2$ contre $K^3$ » est une erreur, et l'erreur se manifeste
+immédiatement dans les mesures. Les deux bornes sont la \emph{somme} de deux termes,
+et lequel domine dépend de la forme des données :
+\begin{equation}\label{eq:kstar}
+(M{+}N)K^2 \;\ge\; 2|\mathcal{R}|K
+\quad\Longleftrightarrow\quad
+K \;\ge\; K^{\star}=\frac{2|\mathcal{R}|}{M+N}.
+\end{equation}
+Sous $K^{\star}$, eALS est essentiellement \emph{linéaire} en $K$ ; ce n'est
+qu'au-dessus que le terme quadratique prend le dessus. $K^{\star}=\CrossKMl$ sur ml-1m
+et $K^{\star}=\CrossKAmz$ sur Amazon Movies, donc les deux jeux de données se situent
+de part et d'autre de la frontière intéressante et nous exécutons le balayage sur les
+deux. (Pour ALS, le même raisonnement donne un régime cubique au-dessus de
+$|\mathcal{R}|/(M{+}N)$, c.-à-d.\ la moitié de $K^{\star}$.)
+
+\begin{figure}[htbp]\centering
+\figplot{factor_scaling}{0.92\textwidth}
+\caption{Coût d'une itération en fonction de $K$, 8 cœurs, log-log. Les repères gris
+sont $K$, $K^2$ et $K^3$ purs, ancrés au plus petit $K$. « plage haute » est la pente
+ajustée sur les deux dernières octaves seulement, où le coût constant de Spark ne
+compte plus.}\label{fig:factors}
+\end{figure}
+
+\begin{table}[htbp]
+\centering\small
+\caption{Secondes par itération en fonction de $K$, 8 cœurs. eALS est notre
+implémentation Spark RDD ; ALS est
+\texttt{pyspark.ml.recommendation.ALS(implicitPrefs=True)}, c.-à-d.\ Hu et
+al.~\cite{hu2008implicit}, chronométré par son coût \emph{marginal}
+$(T_{11}-T_1)/10$ afin d'exclure le coût fixe de construction de ses blocs. ALS n'a pas
+été exécuté au-delà de $K=128$ : une seule itération y coûte déjà des
+minutes.}\label{tab:factors}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+$K$ & eALS (s/itér.) & MLlib ALS (s/itér.) & rapport \\
+\midrule
+\inputrows{tables/tab_factors.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Résultats.} L'affirmation la plus nette est un facteur de
+croissance sur une fenêtre fixe plutôt qu'un exposant ajusté. Sur \textbf{Amazon
+Movies}, entre $K=32$ et $K=128$, le coût d'une itération eALS est multiplié par
+$\GrowthEalsAmz$ et celui d'une itération MLlib ALS par $\GrowthAlsAmz$ - ALS croît
+près de cinq fois plus vite sur la même fenêtre, ce qui est l'affirmation qualitative
+de l'article. La conséquence en termes absolus est un point de croisement : à
+$K=\KAtRatioMinAmz$, MLlib ALS est $\RatioAtMinAmz\times$ \emph{plus rapide} que notre
+eALS, et à $K=\KAtRatioAmz$, eALS est $\RatioAtMaxAmz\times$ plus rapide. Sur
+\textbf{ml-1m}, la même fenêtre donne $\GrowthEalsMl$ contre $\GrowthAlsMl$ : le
+rapport entre les deux taux de croissance est essentiellement le même, sur un jeu de
+données dont la forme est complètement différente.
+
+\paragraph{La forme théorique s'ajuste, et elle nous dit où se trouve réellement le
+croisement.} Ajuster $t = a + bK + cK^2$ pour eALS et $t = a + bK^2 + cK^3$ pour ALS
+- les deux bornes de complexité, avec des constantes libres - reproduit les
+mesures presque exactement : $R^2 = \FitRtwoEalsAmz$ et $\FitRtwoAlsAmz$ sur Amazon
+Movies, $\FitRtwoEalsMl$ et $\FitRtwoAlsMl$ sur ml-1m. Les constantes additives sont
+$\FitConstEalsAmz$\,s pour eALS contre $\FitConstAlsAmz$\,s pour MLlib : notre
+implémentation Python paie environ le double du coût fixe par itération du code JVM
+natif, ce qui explique qu'ALS gagne à petit $K$.
+
+Le chiffre intéressant est le rapport $b/c$, le $K$ auquel le terme d'ordre supérieur
+dépasse le terme inférieur. Le décompte de flops prédit
+$K^{\star}=2|\mathcal{R}|/(M{+}N)=\CrossKAmz$ sur Amazon Movies ; le croisement
+\emph{ajusté} est $\FitCrossEalsAmz$, neuf fois plus élevé. Sur ml-1m la prédiction
+est $\CrossKMl$ et l'ajustement donne $\FitCrossEalsMl$.
+
+\paragraph{Pourquoi le décompte de flops est faux d'un ordre de grandeur, et pourquoi
+c'est la chose la plus utile que dit cette expérience.} Les deux termes de
+$O((M{+}N)K^2+|\mathcal{R}|K)$ ont des constantes \emph{par opération} très
+différentes dans toute implémentation réelle, et la borne de complexité les traite
+comme interchangeables. Dans notre noyau :
+\begin{itemize}\itemsep2pt
+\item le terme en $K^2$ est \texttt{Sq[:, f] @ PT}, un produit matrice-vecteur dense
+que BLAS exécute à plusieurs GFLOP/s hors cache ;
+\item le terme en $|\mathcal{R}|K$ est \texttt{QT[f][idx]} suivi de deux sommes par
+segment \texttt{np.bincount} - un gather aléatoire et un scatter aléatoire sur des
+tableaux de $\textit{nnz}$ éléments, limités par la latence mémoire, un ordre de
+grandeur plus lent par opération.
+\end{itemize}
+Un décompte de flops place donc $K^{\star}$ beaucoup trop bas, et l'exposant mesuré
+reste proche de $\SlopeHiEalsAmz$ sur le haut de la plage où un décompte de flops pur
+prédirait presque $2$. Ce n'est pas une erreur de l'analyse de l'article, qui est
+asymptotiquement correcte ; c'est l'écart ordinaire entre un décompte d'opérations et
+une hiérarchie mémoire, et cela a une conséquence pratique : \textbf{sur nos deux
+jeux de données, eALS se comporte, sur toute la plage de $K$ qu'on peut se permettre
+d'entraîner, bien plus près d'un algorithme $O(|\mathcal{R}|K)$ que d'un algorithme
+$O((M{+}N)K^2)$} - ce qui est meilleur pour eALS que ne le suggère sa propre borne
+de complexité.
+
+\paragraph{Réserve sur la méthode de référence.} L'exposant de MLlib ($\SlopeHiAlsAmz$ sur la
+plage haute) est lui aussi bien en dessous de son $3$ nominal, pour une raison du même
+type plus une autre : MLlib n'utilise pas une inversion de manuel. Elle accumule une
+équation normale et la factorise par Cholesky sur un stockage triangulaire compact, en
+code natif. L'article fait la même observation à propos de sa propre référence ALS en
+Java. La formulation honnête de cette expérience est donc « un algorithme quadratique
+en $K$ écrit en Python contre un algorithme quasi-cubique bien optimisé écrit en code
+natif » - et le quadratique gagne quand même à partir de $K=\FlipKAmz$, par une
+marge qui croît.
+
+\subsection{Convergence et précision}\label{sec:quality}
+%--------------------------
+
+\begin{figure}[htbp]\centering
+\figplot{convergence}{0.92\textwidth}
+\caption{L'objectif~\eqref{eq:obj7}, calculé via~\eqref{eq:objfast}, à chaque
+itération ($K=32$, $c_0=512$, $\alpha=0,4$). La décroissance monotone est la preuve
+pratique que les règles de mise à jour sont les minimiseurs de coordonnées
+exacts.}\label{fig:conv}
+\end{figure}
+
+\begin{table}[htbp]
+\centering\small
+\caption{Convergence de l'objectif, $K=32$, 8 cœurs. « itérations à 1\,\% » est la
+première itération dont l'objectif est à moins de 1\,\% de la valeur après 30
+itérations.}\label{tab:convergence}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Jeu de données & $J$ après 1 itér. & $J$ après 30 & décroissance totale & itérations à 1\,\% & secondes \\
+\midrule
+\inputrows{tables/tab_convergence.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
+L'objectif décroît de façon monotone à chaque itération sur les deux jeux de données,
+ce qui est le contrôle pratique que~\eqref{eq:pu} et~\eqref{eq:qi} sont réellement les
+minimiseurs de coordonnées exacts - un pas de descente de coordonnées même
+légèrement faux se manifesterait immédiatement ici par une remontée. La convergence
+est rapide dans le sens qui compte : $\ConvItersMl$ itérations sur ml-1m et
+$\ConvItersAmz$ sur Amazon Movies amènent $J$ à moins de 1\,\% de sa valeur après 30,
+et l'essentiel de la décroissance totale se produit dans les trois premières. Un budget
+de 20 itérations, utilisé partout ailleurs dans ce rapport, est donc largement au-delà
+du point où l'objectif cesse de bouger.
+
+\begin{table}[htbp]
+\centering\small
+\caption{Protocole hors-ligne : leave-one-out, classement contre le catalogue
+\emph{entier}. $K=32$, $\lambda=0,01$, $c_0=512$, $\alpha=0,4$, 8 cœurs. « fit » est le
+temps d'entraînement (horloge murale) du modèle rapporté.}\label{tab:quality}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Méthode & HR@10 & HR@100 & NDCG@10 & NDCG@100 & fit (s) \\
+\midrule
+\inputrows{tables/tab_quality.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[htbp]\centering
+\figplot{quality_vs_time}{0.92\textwidth}
+\caption{Précision en fonction du temps d'entraînement \emph{réel} (horloge murale),
+pas du numéro d'itération. Chaque marqueur est une exécution d'entraînement complète
+de la durée donnée, évaluée sur l'ensemble retenu.}\label{fig:qualtime}
+\end{figure}
+
+Trois constats, sur Amazon Movies, le jeu de données de l'article.
+
+\textbf{(i) eALS bat nettement l'ALS de MLlib en précision.} HR@100 passe de $\HRa$ à
+$\HRe$, soit $+\EalsOverAls$\,\%, avec NDCG@100 s'améliorant dans la même proportion.
+Les deux sont entraînés sur les mêmes données avec le même $\lambda$, le même $K$ et
+le même nombre d'itérations. L'article rapporte le même ordre sur son propre
+instantané Amazon, et l'attribue à l'objectif sensible à la popularité plutôt qu'à
+l'optimiseur - ce que confirme le point suivant.
+
+\textbf{(ii) La pondération sensible à la popularité vaut à elle seule
+$\PopGain$\,\% de HR@100.} La seule différence entre les deux lignes eALS du
+Tableau~\ref{tab:quality} est $\alpha=0,4$ contre $\alpha=0$ ; tout le reste, y
+compris $c_0$, la graine et le nombre d'itérations, est identique. La variante
+uniforme se situe entre MLlib ALS et eALS complet, exactement là où l'argument de
+l'article dit qu'elle devrait se trouver : une partie du gain vient d'une bonne
+optimisation de l'objectif sur l'ensemble des données, une partie d'une bonne
+pondération des données manquantes. Les deux modèles sont très au-dessus du plancher
+MostPopular ($\PopFloor\times$ son HR@100).
+
+\textbf{(iii) Sur la métrique qui compte en pratique - la précision pour un budget
+de temps donné - eALS domine à chaque budget.} La Figure~\ref{fig:qualtime} est la
+comparaison honnête, car une comparaison par itération masquerait le fait qu'une
+itération ALS et une itération eALS ne représentent pas la même quantité de travail.
+eALS atteint la meilleure précision qu'ALS n'atteint jamais (HR@100 $=\AlsBestHR$)
+après $\EalsTimeToAls$\,s d'entraînement, contre $\AlsTimeToBest$\,s pour ALS, puis
+continue de s'améliorer alors qu'ALS a plafonné : MLlib ALS est plat à partir de
+l'itération~8, à HR@100 $\approx 0,118$. Notez que ceci n'est \emph{pas} une
+affirmation sur la vitesse brute - à $K=32$ une itération ALS sur ces données est
+moins chère que la nôtre, car MLlib est du code JVM natif et nous payons la
+sérialisation Python. C'est une affirmation sur l'endroit où converge chaque
+algorithme.
